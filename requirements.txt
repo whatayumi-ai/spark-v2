@@ -1,0 +1,6 @@
+streamlit
+google-generativeai
+scikit-learn
+numpy
+watchdog
+youtube-transcript-api
