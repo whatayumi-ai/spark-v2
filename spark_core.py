@@ -209,3 +209,39 @@ class SparkEngine:
             block.embedding = self._get_embedding(block.processed_content)
             self.database.append(block)
             print(f"✅ 处理完成: ID {block.id[:6]}")
+            
+            def find_related(self, target_block: SmartBlock, top_k=3):
+        """
+        (补回来的功能) 多维关联实验室：
+        计算余弦相似度，找到库里最相关的内容
+        """
+        # 如果当前块没有向量，或者库里没东西，直接返回空
+        if not target_block.embedding or not self.database:
+            return []
+            
+        # 1. 准备数据：找出库里除了自己以外的所有块
+        db_embeddings = [b.embedding for b in self.database if b.id != target_block.id and b.embedding]
+        db_blocks = [b for b in self.database if b.id != target_block.id and b.embedding]
+        
+        if not db_embeddings:
+            return []
+
+        # 2. 计算相似度
+        import numpy as np
+        from sklearn.metrics.pairwise import cosine_similarity
+        
+        target_vec = np.array(target_block.embedding).reshape(1, -1)
+        db_matrix = np.array(db_embeddings)
+        
+        similarities = cosine_similarity(target_vec, db_matrix)[0]
+        
+        # 3. 排序并取 Top K
+        top_indices = similarities.argsort()[-top_k:][::-1]
+        
+        results = []
+        for idx in top_indices:
+            score = similarities[idx]
+            if score > 0.3: # 设定一个相关性阈值
+                results.append((db_blocks[idx], score))
+                
+        return results
