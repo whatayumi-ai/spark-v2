@@ -4,3 +4,4 @@ scikit-learn
 numpy
 watchdog
 youtube-transcript-api
+yt-dlp
