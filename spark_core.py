@@ -4,10 +4,12 @@ import time
 import glob
 import google.generativeai as genai
 from typing import List
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 from models import SmartBlock
 import prompts
 
-# --- 库导入检查 (防止本地没装报错) ---
+# --- 库导入检查 ---
 try:
     from youtube_transcript_api import YouTubeTranscriptApi
 except ImportError:
@@ -24,7 +26,7 @@ genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 class SparkEngine:
     def __init__(self):
         self.database: List[SmartBlock] = []
-        # 使用 Gemini 2.0 Flash (目前最快且免费)
+        # 使用 Gemini 2.0 Flash (如果报错限流，可改为 gemini-1.5-flash)
         self.model = genai.GenerativeModel('gemini-2.0-flash')
 
     def _call_llm(self, prompt, audio_file=None):
@@ -45,7 +47,6 @@ class SparkEngine:
             
         print(f"正在尝试下载音频: {url} ...")
         
-        # 配置下载选项 (只下载音频，最低音质以加快速度，保存到临时文件夹)
         ydl_opts = {
             'format': 'bestaudio/best',
             'postprocessors': [{
@@ -53,7 +54,7 @@ class SparkEngine:
                 'preferredcodec': 'mp3',
                 'preferredquality': '128',
             }],
-            'outtmpl': '/tmp/%(id)s.%(ext)s', # Linux/Mac 临时目录
+            'outtmpl': '/tmp/%(id)s.%(ext)s',
             'quiet': True,
             'no_warnings': True,
         }
@@ -62,7 +63,6 @@ class SparkEngine:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 video_id = info['id']
-                # 找到下载好的文件
                 files = glob.glob(f"/tmp/{video_id}.mp3")
                 if files:
                     return files[0], None
@@ -86,7 +86,6 @@ class SparkEngine:
             if not video_id:
                 return None, "无法解析 Video ID"
 
-            # 尝试抓取中文或英文字幕
             transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['zh-CN', 'zh-Hans', 'zh-Hant', 'en'])
             full_text = " ".join([t['text'] for t in transcript_list])
             return f"[自动抓取的字幕] {full_text}", None
@@ -95,22 +94,19 @@ class SparkEngine:
             return None, str(e)
 
     def _upload_audio(self, file_path_or_bytes, mime_type="audio/mp3"):
-        """上传音频 (支持文件路径 或 二进制流)"""
+        """上传音频"""
         try:
             print("正在上传音频到 Gemini...")
             
             if isinstance(file_path_or_bytes, str):
-                # 如果是文件路径 (YouTube 下载的 /tmp/xxx.mp3)
                 uploaded_file = genai.upload_file(file_path_or_bytes, mime_type=mime_type)
             else:
-                # 如果是二进制流 (前端用户拖拽上传的)
                 import tempfile
                 tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
                 tfile.write(file_path_or_bytes)
                 tfile.close()
                 uploaded_file = genai.upload_file(tfile.name, mime_type=mime_type)
             
-            # 等待 Google 处理
             while uploaded_file.state.name == "PROCESSING":
                 time.sleep(2)
                 uploaded_file = genai.get_file(uploaded_file.name)
@@ -122,7 +118,6 @@ class SparkEngine:
 
     def _get_embedding(self, text):
         try:
-            # 截断过长的文本以防 embedding 报错
             truncated_text = text[:9000]
             result = genai.embed_content(
                 model="models/text-embedding-004",
@@ -132,7 +127,6 @@ class SparkEngine:
             )
             return result['embedding']
         except Exception as e:
-            # print(f"Embedding Error: {e}") # 忽略非关键报错
             return []
 
     def process_block(self, block: SmartBlock, file_bytes=None):
@@ -143,17 +137,13 @@ class SparkEngine:
         status_msg = ""
 
         # === 核心逻辑分支 ===
-        
-        # 1. 优先：用户直接上传了音频文件
         if file_bytes:
             audio_resource = self._upload_audio(file_bytes)
             if not audio_resource:
                 block.processed_content = "❌ 用户音频上传失败"
                 return
 
-        # 2. 其次：处理 YouTube 链接
         elif block.source_type == "video_snippet" and ("youtube.com" in block.raw_content or "youtu.be" in block.raw_content):
-            # >> Plan A: 试着抓字幕
             transcript_text, error = self._get_youtube_transcript(block.raw_content)
             
             if transcript_text:
@@ -161,11 +151,8 @@ class SparkEngine:
                 prompt_text = transcript_text
                 status_msg = "(基于CC字幕)"
             else:
-                # >> Plan B: 字幕失败，启动下载音频
-                print(f"⚠️ 字幕抓取失败，启动 Plan B 音频下载... (原因: {error})")
-                
-                # 在前端显示的临时占位符
-                block.processed_content = "⚠️ 正在下载视频音频，这可能需要 1-2 分钟，请耐心等待..."
+                print(f"⚠️ 启动 Plan B 音频下载... (原因: {error})")
+                block.processed_content = "⚠️ 正在下载视频音频(Plan B)，这可能需要 1-2 分钟，请耐心等待..."
                 
                 mp3_path, dl_error = self._download_youtube_audio(block.raw_content)
                 
@@ -182,7 +169,6 @@ class SparkEngine:
 
         # === 准备 Prompt ===
         if block.source_type == "video_snippet":
-            # 如果有音频资源，提示词改一下
             base_prompt = prompts.VIDEO_PROCESS_PROMPT if not audio_resource else "请认真听这段音频，整理出详细的笔记。忽略口语废话，保留核心观点，按 Markdown 格式输出。"
             final_prompt = base_prompt.format(text=prompt_text) if not audio_resource else base_prompt
         elif block.source_type == "chat_log":
@@ -190,13 +176,9 @@ class SparkEngine:
         else:
             final_prompt = prompt_text
             
-        # === 调用 AI ===
-        result = self._call_llm(final_prompt, audio_file=audio_resource)
+        block.processed_content = self._call_llm(final_prompt, audio_file=audio_resource)
+        block.processed_content = f"{status_msg}\n\n{block.processed_content}"
         
-        # 加上来源标记
-        block.processed_content = f"{status_msg}\n\n{result}"
-        
-        # === 后处理 (打标/存储) ===
         if block.processed_content and "Error" not in block.processed_content:
             try:
                 tag_prompt = prompts.TAGGING_PROMPT.format(content=block.processed_content)
@@ -209,39 +191,29 @@ class SparkEngine:
             block.embedding = self._get_embedding(block.processed_content)
             self.database.append(block)
             print(f"✅ 处理完成: ID {block.id[:6]}")
-            
-            def find_related(self, target_block: SmartBlock, top_k=3):
-        """
-        (补回来的功能) 多维关联实验室：
-        计算余弦相似度，找到库里最相关的内容
-        """
-        # 如果当前块没有向量，或者库里没东西，直接返回空
+
+    def find_related(self, target_block: SmartBlock, top_k=3):
+        """关联实验室核心算法"""
         if not target_block.embedding or not self.database:
             return []
             
-        # 1. 准备数据：找出库里除了自己以外的所有块
         db_embeddings = [b.embedding for b in self.database if b.id != target_block.id and b.embedding]
         db_blocks = [b for b in self.database if b.id != target_block.id and b.embedding]
         
         if not db_embeddings:
             return []
 
-        # 2. 计算相似度
-        import numpy as np
-        from sklearn.metrics.pairwise import cosine_similarity
-        
         target_vec = np.array(target_block.embedding).reshape(1, -1)
         db_matrix = np.array(db_embeddings)
         
         similarities = cosine_similarity(target_vec, db_matrix)[0]
         
-        # 3. 排序并取 Top K
         top_indices = similarities.argsort()[-top_k:][::-1]
         
         results = []
         for idx in top_indices:
             score = similarities[idx]
-            if score > 0.3: # 设定一个相关性阈值
+            if score > 0.3:
                 results.append((db_blocks[idx], score))
                 
         return results
