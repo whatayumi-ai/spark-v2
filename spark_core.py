@@ -27,7 +27,7 @@ class SparkEngine:
     def __init__(self):
         self.database: List[SmartBlock] = []
         # 使用 Gemini 2.0 Flash (如果报错限流，可改为 gemini-1.5-flash)
-        self.model = genai.GenerativeModel('gemini-1.5-flash-001')
+        self.model = genai.GenerativeModel('gemini-2.5-flash')
 
     def _call_llm(self, prompt, audio_file=None):
         try:
