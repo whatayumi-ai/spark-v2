@@ -26,10 +26,15 @@ genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 class SparkEngine:
     def __init__(self):
         self.database: List[SmartBlock] = []
-        # 使用 Gemini 2.0 Flash (如果报错限流，可改为 gemini-1.5-flash)
+        # 使用 Gemini 2.5 Flash (目前最稳)
         self.model = genai.GenerativeModel('gemini-2.5-flash')
 
     def _call_llm(self, prompt, audio_file=None):
+        """调用大模型，增加强制休眠以防止 429 报错"""
+        # --- 优化点 2: 强制休息 2 秒 ---
+        print("⏳ 正在等待 API 冷却 (2s)...")
+        time.sleep(2) 
+        
         try:
             content_parts = [prompt]
             if audio_file:
@@ -118,6 +123,8 @@ class SparkEngine:
 
     def _get_embedding(self, text):
         try:
+            # Embedding 调用也加个小延迟，更稳
+            time.sleep(1)
             truncated_text = text[:9000]
             result = genai.embed_content(
                 model="models/text-embedding-004",
@@ -175,19 +182,33 @@ class SparkEngine:
             final_prompt = prompts.CHAT_PROCESS_PROMPT.format(text=prompt_text)
         else:
             final_prompt = prompt_text
-            
-        block.processed_content = self._call_llm(final_prompt, audio_file=audio_resource)
-        block.processed_content = f"{status_msg}\n\n{block.processed_content}"
         
-        if block.processed_content and "Error" not in block.processed_content:
-            try:
-                tag_prompt = prompts.TAGGING_PROMPT.format(content=block.processed_content)
-                tags_raw = self._call_llm(tag_prompt)
-                clean_json = tags_raw.replace("```json", "").replace("```", "").strip()
-                block.ai_tags = json.loads(clean_json)
-            except:
-                block.ai_tags = ["#AI_Tag_Error"]
+        # --- 优化 1: 合并 Prompt (总结+标签 一次搞定) ---
+        # 拼接指令：让 AI 在总结最后，单独输出 JSON 格式的标签
+        combined_prompt = final_prompt + "\n\n" + "-"*20 + "\n【附加任务】在笔记的最后，请务必另起一行，以 JSON 格式输出 3-5 个核心标签（用于分类），格式严格如下：\nTagsJSON: [\"#标签1\", \"#标签2\", \"#标签3\"]"
 
+        # 1. 调用 LLM (总结 + 标签) - 减少一次调用
+        full_response = self._call_llm(combined_prompt, audio_file=audio_resource)
+        
+        # 2. 解析结果
+        if full_response and "TagsJSON:" in full_response:
+            try:
+                parts = full_response.split("TagsJSON:")
+                content_part = parts[0].strip()
+                tags_json_str = parts[1].strip().replace("```json", "").replace("```", "").strip()
+                
+                block.processed_content = f"{status_msg}\n\n{content_part}"
+                block.ai_tags = json.loads(tags_json_str)
+            except:
+                # 如果解析失败，保留全文，给个错误标签
+                block.processed_content = f"{status_msg}\n\n{full_response}"
+                block.ai_tags = ["#TagParseError"]
+        else:
+            block.processed_content = f"{status_msg}\n\n{full_response}"
+            block.ai_tags = []
+
+        # 3. Embedding (必须保留，用于搜索，但现在总共只调 2 次 API)
+        if block.processed_content and "Error" not in block.processed_content:
             block.embedding = self._get_embedding(block.processed_content)
             self.database.append(block)
             print(f"✅ 处理完成: ID {block.id[:6]}")
